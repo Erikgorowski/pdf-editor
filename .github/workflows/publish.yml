@@ -1,0 +1,82 @@
+# Publishes PDF Editor from this repository:
+#  - Every push to main  → the web app goes live on GitHub Pages
+#                          (https://<owner>.github.io/<repo>/), installable as an app.
+#  - Every tag like v0.2.0 → Windows installers are built on a Windows machine and
+#                          attached to a GitHub Release, with stable download links:
+#      https://github.com/<owner>/<repo>/releases/latest/download/PDF-Editor-Setup.exe
+#      https://github.com/<owner>/<repo>/releases/latest/download/PDF-Editor.msi
+# Both can also be started by hand from the Actions tab ("Run workflow").
+name: Publish
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build web app
+        run: npm run build
+        env:
+          VITE_WINDOWS_INSTALLER_URL: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/PDF-Editor-Setup.exe
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  windows:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - run: npm ci
+      - name: Build installers
+        run: npm run tauri build -- --bundles msi,nsis
+      - name: Give installers stable names
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item (Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1) out/PDF-Editor-Setup.exe
+          Copy-Item (Get-ChildItem src-tauri/target/release/bundle/msi/*.msi | Select-Object -First 1) out/PDF-Editor.msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-editor-windows
+          path: out/*
+          if-no-files-found: error
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" out/PDF-Editor-Setup.exe out/PDF-Editor.msi --title "PDF Editor ${{ github.ref_name }}" --generate-notes
