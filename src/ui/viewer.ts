@@ -49,7 +49,7 @@ class PageView {
       this.canvas.width = this.canvas.height = 0;
       this.canvas = canvas;
       this.renderedScale = scale;
-      if (state.tool === "edittext") void this.viewer.syncHits(this);
+      if (textClickable()) void this.viewer.syncHits(this);
     } catch (err) {
       console.error("Render failed", err);
     } finally {
@@ -62,7 +62,12 @@ class PageView {
 interface ActiveText {
   el: HTMLElement;
   edit: TextEdit;
+  /** Set when editing original PDF text: lets an unchanged edit be dropped again. */
+  replaced?: { coverId: string; original: string; wasDirty: boolean };
 }
+
+/** Original PDF text can be clicked to edit it in the Select and Edit-text tools. */
+const textClickable = () => state.tool === "select" || state.tool === "edittext";
 
 export class Viewer {
   zoom = 1;
@@ -98,7 +103,7 @@ export class Viewer {
         this.finishTextEditing();
         this.scroller.dataset.tool = state.tool;
         this.syncAllLayers();
-        this.views.forEach((v) => void this.syncHits(v));
+        this.views.forEach((v) => v.renderedScale && void this.syncHits(v));
       }
     });
   }
@@ -137,7 +142,7 @@ export class Viewer {
     this.syncAllLayers();
     for (const v of this.views) {
       if (v.visible) void v.ensureRendered();
-      if (state.tool === "edittext") void this.syncHits(v);
+      if (textClickable() && v.renderedScale) void this.syncHits(v);
     }
     this.scroller.dispatchEvent(new CustomEvent("zoomchange"));
   }
@@ -296,8 +301,15 @@ export class Viewer {
 
     this.finishTextEditing();
     const pt = this.toPage(e, view);
+    const hit = textClickable() ? target.closest<HTMLElement>(".hit") : null;
+    if (hit && view.runs) {
+      e.preventDefault();
+      this.replaceRun(view, view.runs[Number(hit.dataset.run)], { x: e.clientX, y: e.clientY });
+      return;
+    }
     switch (state.tool) {
       case "select":
+      case "edittext":
         state.select(null);
         break;
       case "text":
@@ -313,14 +325,6 @@ export class Viewer {
         e.preventDefault();
         this.drawInk(e, view, pt);
         break;
-      case "edittext": {
-        const hit = target.closest<HTMLElement>(".hit");
-        if (hit && view.runs) {
-          e.preventDefault();
-          this.replaceRun(view, view.runs[Number(hit.dataset.run)]);
-        }
-        break;
-      }
     }
   }
 
@@ -368,7 +372,12 @@ export class Viewer {
         const el = this.elFor(edit.id);
         if (el) this.updateEditEl(el, edit);
       },
-      (moved) => moved && state.editsChanged(),
+      (moved) => {
+        if (moved) return state.editsChanged();
+        // A click (no drag) on text you added opens it for editing at the clicked spot.
+        const el = this.elFor(edit.id);
+        if (edit.kind === "text" && el) this.beginTextEditing(el, edit, false, true, { x: e.clientX, y: e.clientY });
+      },
     );
   }
 
@@ -475,19 +484,30 @@ export class Viewer {
     if (el) this.beginTextEditing(el, edit, false, false);
   }
 
-  private beginTextEditing(el: HTMLElement, edit: TextEdit, selectAll: boolean, checkpoint = true) {
+  private beginTextEditing(
+    el: HTMLElement,
+    edit: TextEdit,
+    selectAll: boolean,
+    checkpoint = true,
+    caretAt?: { x: number; y: number },
+    replaced?: ActiveText["replaced"],
+  ) {
     if (this.editing?.el === el) return;
     this.finishTextEditing();
     if (checkpoint) state.checkpoint();
     state.select(edit.id);
-    this.editing = { el, edit };
+    this.editing = { el, edit, replaced };
     el.querySelector(".handle")?.remove();
     el.contentEditable = "plaintext-only";
     el.classList.add("editing");
     el.focus();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    if (!selectAll) range.collapse(false);
+    // Put the caret where the user clicked, so editing part of a line doesn't wipe the rest.
+    const clicked = caretAt ? document.caretRangeFromPoint?.(caretAt.x, caretAt.y) : null;
+    const range = clicked && el.contains(clicked.startContainer) ? clicked : document.createRange();
+    if (range !== clicked) {
+      range.selectNodeContents(el);
+      if (!selectAll) range.collapse(false);
+    }
     const sel = window.getSelection();
     sel?.removeAllRanges();
     sel?.addRange(range);
@@ -521,10 +541,16 @@ export class Viewer {
 
   private endTextEditing(el: HTMLElement, edit: TextEdit) {
     if (this.editing?.el !== el) return;
+    const { replaced } = this.editing;
     this.editing = null;
     el.contentEditable = "false";
     el.classList.remove("editing");
-    if (!edit.text.trim()) {
+    if (replaced && edit.text === replaced.original) {
+      // Clicked into PDF text but changed nothing: leave the page exactly as it was.
+      state.discardEdits([replaced.coverId, edit.id], replaced.wasDirty);
+      return;
+    }
+    if (!edit.text.trim() && !replaced) {
       state.edits = state.edits.filter((e) => e.id !== edit.id);
       if (state.selectedId === edit.id) state.selectedId = null;
     }
@@ -540,7 +566,7 @@ export class Viewer {
   }
 
   /** "Edit text": hide the original words behind a matched-colour patch and put an editable copy on top. */
-  private replaceRun(view: PageView, run: TextRun) {
+  private replaceRun(view: PageView, run: TextRun, caretAt?: { x: number; y: number }) {
     const style = guessFont(run.realName, run.fontFamily, run);
     const pad = Math.max(0.6, run.size * 0.06);
     const box: Bounds = { x: run.x - pad, y: run.y - pad, w: run.w + pad * 2, h: run.h + pad * 2 };
@@ -558,16 +584,17 @@ export class Viewer {
       ...style,
       color: this.sampleTextColor(view, box, bg),
     };
+    const wasDirty = state.dirty;
     state.checkpoint();
     state.edits.push(cover, text);
     state.selectedId = text.id;
     state.editsChanged();
     const el = this.elFor(text.id);
-    if (el) this.beginTextEditing(el, text, true, false);
+    if (el) this.beginTextEditing(el, text, !caretAt, false, caretAt, { coverId: cover.id, original: run.str, wasDirty });
   }
 
   async syncHits(view: PageView) {
-    if (state.tool !== "edittext") {
+    if (!textClickable()) {
       view.hits.replaceChildren();
       return;
     }
@@ -577,7 +604,7 @@ export class Viewer {
       if (version !== this.version) return;
       view.runs = runs;
     }
-    if (state.tool !== "edittext" || !view.runs) return;
+    if (!textClickable() || !view.runs) return;
     const z = this.zoom;
     view.hits.replaceChildren(
       ...view.runs.map((run, i) => {

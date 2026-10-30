@@ -6,7 +6,7 @@ import { h } from "./dialogs";
 import { icon } from "./icons";
 
 const TOOL_HINTS: Record<string, string> = {
-  select: "Click an edit to select it, drag to move, double-click text to change it. Press Delete to remove.",
+  select: "Click any text in the PDF to edit it. Click your additions to select and drag them; press Delete to remove.",
   edittext: "Click any line of text in the PDF to change it.",
   text: "Click anywhere on the page to add text.",
   whiteout: "Drag over content to cover it with the page colour.",

@@ -94,6 +94,15 @@ export class DocState {
     this.touch("edits");
   }
 
+  /** Drops edits that turned out to change nothing, together with the undo step that created them. */
+  discardEdits(ids: string[], wasDirty: boolean) {
+    this.edits = this.edits.filter((e) => !ids.includes(e.id));
+    if (this.selectedId && ids.includes(this.selectedId)) this.selectedId = null;
+    this.undoStack.pop();
+    this.dirty = wasDirty;
+    this.emit("edits");
+  }
+
   removeEdit(id: string) {
     const idx = this.edits.findIndex((e) => e.id === id);
     if (idx < 0) return;
